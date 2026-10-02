@@ -1,0 +1,793 @@
+`timescale 1ns / 1ps
+
+module MIPS_Wrapper (
+    input  wire clk,
+    input  wire reset
+);
+
+    // ============================================================
+    // Instruction opcodes
+    // ============================================================
+
+    localparam ADD   = 6'b000000;
+    localparam SUB   = 6'b000001;
+    localparam AND   = 6'b000010;
+    localparam OR    = 6'b000011;
+    localparam SLT   = 6'b000100;
+    localparam MUL   = 6'b000101;
+
+    localparam HLT   = 6'b111111;
+
+    localparam LW    = 6'b001000;
+    localparam SW    = 6'b001001;
+
+    localparam ADDI  = 6'b001010;
+    localparam SUBI  = 6'b001011;
+    localparam SLTI  = 6'b001100;
+
+    localparam BNEQZ = 6'b001101;
+    localparam BEQZ  = 6'b001110;
+
+
+    // ============================================================
+    // Instruction types
+    // ============================================================
+
+    localparam TYPE_RR     = 3'b000;
+    localparam TYPE_RI     = 3'b001;
+    localparam TYPE_LOAD   = 3'b010;
+    localparam TYPE_STORE  = 3'b011;
+    localparam TYPE_BRANCH = 3'b100;
+    localparam TYPE_HALT   = 3'b101;
+    localparam TYPE_NOP    = 3'b111;
+
+
+    // ============================================================
+    // Register file and memory
+    // ============================================================
+
+    reg [31:0] register [0:31];
+    reg [31:0] Mem       [0:1023];
+
+
+    // ============================================================
+    // Program Counter
+    // ============================================================
+
+    reg [31:0] PC;
+
+
+    // ============================================================
+    // IF/ID Pipeline Register
+    // ============================================================
+
+    reg [31:0] IF_ID_IR;
+    reg [31:0] IF_ID_NPC;
+    reg        IF_ID_valid;
+
+
+    // ============================================================
+    // ID/EX Pipeline Register
+    // ============================================================
+
+    reg [31:0] ID_EX_IR;
+    reg [31:0] ID_EX_NPC;
+    reg [31:0] ID_EX_A;
+    reg [31:0] ID_EX_B;
+    reg [31:0] ID_EX_Imm;
+
+    reg [2:0]  ID_EX_type;
+
+    reg        ID_EX_valid;
+
+
+    // ============================================================
+    // EX/MEM Pipeline Register
+    // ============================================================
+
+    reg [31:0] EX_MEM_IR;
+    reg [31:0] EX_MEM_ALUout;
+    reg [31:0] EX_MEM_B;
+
+    reg [2:0]  EX_MEM_type;
+
+    reg        EX_MEM_cond;
+    reg        EX_MEM_valid;
+
+
+    // ============================================================
+    // MEM/WB Pipeline Register
+    // ============================================================
+
+    reg [31:0] MEM_WB_IR;
+    reg [31:0] MEM_WB_ALUout;
+    reg [31:0] MEM_WB_LMD;
+
+    reg [2:0]  MEM_WB_type;
+
+    reg        MEM_WB_valid;
+
+
+    // ============================================================
+    // Halt
+    // ============================================================
+
+    reg halted;
+
+
+    // ============================================================
+    // Decode wires
+    // ============================================================
+
+    wire [5:0] IF_ID_opcode = IF_ID_IR[31:26];
+
+    wire [4:0] IF_ID_rs = IF_ID_IR[25:21];
+    wire [4:0] IF_ID_rt = IF_ID_IR[20:16];
+    wire [4:0] IF_ID_rd = IF_ID_IR[15:11];
+
+
+    // ============================================================
+    // Register read
+    // ============================================================
+
+    wire [31:0] reg_rs_value =
+                    (IF_ID_rs == 5'd0) ? 32'd0 :
+                    register[IF_ID_rs];
+
+    wire [31:0] reg_rt_value =
+                    (IF_ID_rt == 5'd0) ? 32'd0 :
+                    register[IF_ID_rt];
+
+
+    // ============================================================
+    // Decode type
+    // ============================================================
+
+    reg [2:0] decoded_type;
+
+    always @(*) begin
+
+        case (IF_ID_opcode)
+
+            ADD,
+            SUB,
+            MUL,
+            AND,
+            OR,
+            SLT:
+                decoded_type = TYPE_RR;
+
+            ADDI,
+            SUBI,
+            SLTI:
+                decoded_type = TYPE_RI;
+
+            LW:
+                decoded_type = TYPE_LOAD;
+
+            SW:
+                decoded_type = TYPE_STORE;
+
+            BEQZ,
+            BNEQZ:
+                decoded_type = TYPE_BRANCH;
+
+            HLT:
+                decoded_type = TYPE_HALT;
+
+            default:
+                decoded_type = TYPE_NOP;
+
+        endcase
+
+    end
+
+
+    // ============================================================
+    // Destination register of EX/MEM instruction
+    // ============================================================
+
+    reg [4:0] EX_MEM_dest;
+
+    always @(*) begin
+
+        case (EX_MEM_type)
+
+            TYPE_RR:
+                EX_MEM_dest = EX_MEM_IR[15:11];
+
+            TYPE_RI,
+            TYPE_LOAD:
+                EX_MEM_dest = EX_MEM_IR[20:16];
+
+            default:
+                EX_MEM_dest = 5'd0;
+
+        endcase
+
+    end
+
+
+    // ============================================================
+    // Destination register of MEM/WB instruction
+    // ============================================================
+
+    reg [4:0] MEM_WB_dest;
+
+    always @(*) begin
+
+        case (MEM_WB_type)
+
+            TYPE_RR:
+                MEM_WB_dest = MEM_WB_IR[15:11];
+
+            TYPE_RI,
+            TYPE_LOAD:
+                MEM_WB_dest = MEM_WB_IR[20:16];
+
+            default:
+                MEM_WB_dest = 5'd0;
+
+        endcase
+
+    end
+
+
+    // ============================================================
+    // Forwarding logic
+    // ============================================================
+
+    reg [31:0] forward_A;
+    reg [31:0] forward_B;
+
+
+    always @(*) begin
+
+        // Default values
+        forward_A = ID_EX_A;
+        forward_B = ID_EX_B;
+
+
+        // --------------------------------------------------------
+        // EX/MEM forwarding
+        // --------------------------------------------------------
+
+        if (EX_MEM_valid &&
+            (EX_MEM_type == TYPE_RR ||
+             EX_MEM_type == TYPE_RI) &&
+            (EX_MEM_dest != 5'd0) &&
+            (EX_MEM_dest == ID_EX_IR[25:21])) begin
+
+            forward_A = EX_MEM_ALUout;
+
+        end
+        else if (MEM_WB_valid &&
+                 (MEM_WB_type == TYPE_RR ||
+                  MEM_WB_type == TYPE_RI) &&
+                 (MEM_WB_dest != 5'd0) &&
+                 (MEM_WB_dest == ID_EX_IR[25:21])) begin
+
+            forward_A = MEM_WB_ALUout;
+
+        end
+        else if (MEM_WB_valid &&
+                 (MEM_WB_type == TYPE_LOAD) &&
+                 (MEM_WB_dest != 5'd0) &&
+                 (MEM_WB_dest == ID_EX_IR[25:21])) begin
+
+            forward_A = MEM_WB_LMD;
+
+        end
+
+
+        // --------------------------------------------------------
+        // Forwarding for B operand
+        // --------------------------------------------------------
+
+        if (EX_MEM_valid &&
+            (EX_MEM_type == TYPE_RR ||
+             EX_MEM_type == TYPE_RI) &&
+            (EX_MEM_dest != 5'd0) &&
+            (EX_MEM_dest == ID_EX_IR[20:16])) begin
+
+            forward_B = EX_MEM_ALUout;
+
+        end
+        else if (MEM_WB_valid &&
+                 (MEM_WB_type == TYPE_RR ||
+                  MEM_WB_type == TYPE_RI) &&
+                 (MEM_WB_dest != 5'd0) &&
+                 (MEM_WB_dest == ID_EX_IR[20:16])) begin
+
+            forward_B = MEM_WB_ALUout;
+
+        end
+        else if (MEM_WB_valid &&
+                 (MEM_WB_type == TYPE_LOAD) &&
+                 (MEM_WB_dest != 5'd0) &&
+                 (MEM_WB_dest == ID_EX_IR[20:16])) begin
+
+            forward_B = MEM_WB_LMD;
+
+        end
+
+    end
+
+
+    // ============================================================
+    // Load-use hazard detection
+    // ============================================================
+
+    reg stall;
+
+
+    always @(*) begin
+
+        stall = 1'b0;
+
+        if (ID_EX_valid &&
+            (ID_EX_type == TYPE_LOAD)) begin
+
+            if ((ID_EX_IR[20:16] != 5'd0) &&
+                (ID_EX_IR[20:16] == IF_ID_rs)) begin
+
+                stall = 1'b1;
+
+            end
+
+            if ((ID_EX_IR[20:16] != 5'd0) &&
+                (ID_EX_IR[20:16] == IF_ID_rt) &&
+                ((IF_ID_opcode == ADD)  ||
+                 (IF_ID_opcode == SUB)  ||
+                 (IF_ID_opcode == MUL)  ||
+                 (IF_ID_opcode == AND)  ||
+                 (IF_ID_opcode == OR)   ||
+                 (IF_ID_opcode == SLT)  ||
+                 (IF_ID_opcode == SW))) begin
+
+                stall = 1'b1;
+
+            end
+
+        end
+
+    end
+
+
+    // ============================================================
+    // Branch decision
+    // ============================================================
+
+    reg branch_taken;
+    reg [31:0] branch_target;
+
+
+    always @(*) begin
+
+        branch_taken = 1'b0;
+        branch_target = 32'd0;
+
+        if (EX_MEM_valid &&
+            (EX_MEM_type == TYPE_BRANCH)) begin
+
+            branch_target = EX_MEM_ALUout;
+
+            case (EX_MEM_IR[31:26])
+
+                BEQZ: begin
+
+                    if (EX_MEM_cond)
+                        branch_taken = 1'b1;
+
+                end
+
+                BNEQZ: begin
+
+                    if (!EX_MEM_cond)
+                        branch_taken = 1'b1;
+
+                end
+
+                default:
+                    branch_taken = 1'b0;
+
+            endcase
+
+        end
+
+    end
+
+
+    // ============================================================
+    // ALU result
+    // ============================================================
+
+    reg [31:0] alu_result;
+    reg        alu_cond;
+
+
+    always @(*) begin
+
+        alu_result = 32'd0;
+        alu_cond = 1'b0;
+
+        case (ID_EX_type)
+
+            // ----------------------------------------------------
+            // R-type instructions
+            // ----------------------------------------------------
+
+            TYPE_RR: begin
+
+                case (ID_EX_IR[31:26])
+
+                    ADD:
+                        alu_result = forward_A + forward_B;
+
+                    SUB:
+                        alu_result = forward_A - forward_B;
+
+                    MUL:
+                        alu_result = forward_A * forward_B;
+
+                    AND:
+                        alu_result = forward_A & forward_B;
+
+                    OR:
+                        alu_result = forward_A | forward_B;
+
+                    SLT:
+                        alu_result =
+                            ($signed(forward_A) <
+                             $signed(forward_B));
+
+                    default:
+                        alu_result = 32'd0;
+
+                endcase
+
+            end
+
+
+            // ----------------------------------------------------
+            // Immediate instructions
+            // ----------------------------------------------------
+
+            TYPE_RI: begin
+
+                case (ID_EX_IR[31:26])
+
+                    ADDI:
+                        alu_result = forward_A + ID_EX_Imm;
+
+                    SUBI:
+                        alu_result = forward_A - ID_EX_Imm;
+
+                    SLTI:
+                        alu_result =
+                            ($signed(forward_A) <
+                             $signed(ID_EX_Imm));
+
+                    default:
+                        alu_result = 32'd0;
+
+                endcase
+
+            end
+
+
+            // ----------------------------------------------------
+            // Load / Store address
+            // ----------------------------------------------------
+
+            TYPE_LOAD,
+            TYPE_STORE: begin
+
+                alu_result = forward_A + ID_EX_Imm;
+
+            end
+
+
+            // ----------------------------------------------------
+            // Branch
+            // ----------------------------------------------------
+
+            TYPE_BRANCH: begin
+
+                alu_result = ID_EX_NPC + ID_EX_Imm;
+
+                alu_cond = (forward_A == 32'd0);
+
+            end
+
+
+            default: begin
+
+                alu_result = 32'd0;
+                alu_cond = 1'b0;
+
+            end
+
+        endcase
+
+    end
+
+
+    // ============================================================
+    // Sequential pipeline
+    // ============================================================
+
+    integer i;
+
+
+    always @(posedge clk) begin
+
+        // ========================================================
+        // RESET
+        // ========================================================
+
+        if (reset) begin
+
+            PC <= 32'd0;
+
+            IF_ID_IR <= 32'd0;
+            IF_ID_NPC <= 32'd0;
+            IF_ID_valid <= 1'b0;
+
+            ID_EX_IR <= 32'd0;
+            ID_EX_NPC <= 32'd0;
+            ID_EX_A <= 32'd0;
+            ID_EX_B <= 32'd0;
+            ID_EX_Imm <= 32'd0;
+            ID_EX_type <= TYPE_NOP;
+            ID_EX_valid <= 1'b0;
+
+            EX_MEM_IR <= 32'd0;
+            EX_MEM_ALUout <= 32'd0;
+            EX_MEM_B <= 32'd0;
+            EX_MEM_type <= TYPE_NOP;
+            EX_MEM_cond <= 1'b0;
+            EX_MEM_valid <= 1'b0;
+
+            MEM_WB_IR <= 32'd0;
+            MEM_WB_ALUout <= 32'd0;
+            MEM_WB_LMD <= 32'd0;
+            MEM_WB_type <= TYPE_NOP;
+            MEM_WB_valid <= 1'b0;
+
+            halted <= 1'b0;
+
+            for (i = 0; i < 32; i = i + 1)
+                register[i] <= 32'd0;
+
+        end
+
+
+        // ========================================================
+        // NORMAL OPERATION
+        // ========================================================
+
+        else if (!halted) begin
+
+
+            // ====================================================
+            // WRITE BACK
+            // ====================================================
+
+            if (MEM_WB_valid) begin
+
+                case (MEM_WB_type)
+
+                    TYPE_RR: begin
+
+                        if (MEM_WB_IR[15:11] != 5'd0)
+                            register[MEM_WB_IR[15:11]]
+                                <= MEM_WB_ALUout;
+
+                    end
+
+
+                    TYPE_RI: begin
+
+                        if (MEM_WB_IR[20:16] != 5'd0)
+                            register[MEM_WB_IR[20:16]]
+                                <= MEM_WB_ALUout;
+
+                    end
+
+
+                    TYPE_LOAD: begin
+
+                        if (MEM_WB_IR[20:16] != 5'd0)
+                            register[MEM_WB_IR[20:16]]
+                                <= MEM_WB_LMD;
+
+                    end
+
+
+                    TYPE_HALT: begin
+
+                        halted <= 1'b1;
+
+                    end
+
+                    default:
+                        ;
+
+                endcase
+
+            end
+
+
+            // ====================================================
+            // MEMORY STAGE
+            // ====================================================
+
+            MEM_WB_valid <= EX_MEM_valid;
+            MEM_WB_IR <= EX_MEM_IR;
+            MEM_WB_type <= EX_MEM_type;
+
+            if (EX_MEM_valid) begin
+
+                case (EX_MEM_type)
+
+                    TYPE_RR,
+                    TYPE_RI: begin
+
+                        MEM_WB_ALUout <= EX_MEM_ALUout;
+
+                    end
+
+
+                    TYPE_LOAD: begin
+
+                        MEM_WB_LMD <= Mem[EX_MEM_ALUout[31:2]];
+
+                    end
+
+
+                    TYPE_STORE: begin
+
+                        Mem[EX_MEM_ALUout[31:2]]
+                            <= EX_MEM_B;
+
+                    end
+
+
+                    default:
+                        ;
+
+                endcase
+
+            end
+
+
+            // ====================================================
+            // EX/MEM PIPELINE REGISTER
+            // ====================================================
+
+            EX_MEM_valid <= ID_EX_valid;
+            EX_MEM_IR <= ID_EX_IR;
+            EX_MEM_type <= ID_EX_type;
+
+            if (ID_EX_valid) begin
+
+                EX_MEM_ALUout <= alu_result;
+                EX_MEM_B <= forward_B;
+                EX_MEM_cond <= alu_cond;
+
+            end
+            else begin
+
+                EX_MEM_ALUout <= 32'd0;
+                EX_MEM_B <= 32'd0;
+                EX_MEM_cond <= 1'b0;
+
+            end
+
+
+            // ====================================================
+            // ID/EX PIPELINE REGISTER
+            // ====================================================
+
+            if (branch_taken) begin
+
+                // Flush instruction after branch
+
+                ID_EX_valid <= 1'b0;
+                ID_EX_type <= TYPE_NOP;
+                ID_EX_IR <= 32'd0;
+
+            end
+
+            else if (stall) begin
+
+                // Insert bubble
+
+                ID_EX_valid <= 1'b0;
+                ID_EX_type <= TYPE_NOP;
+                ID_EX_IR <= 32'd0;
+
+            end
+
+            else begin
+
+                ID_EX_valid <= IF_ID_valid;
+
+                ID_EX_IR <= IF_ID_IR;
+                ID_EX_NPC <= IF_ID_NPC;
+
+                ID_EX_A <= reg_rs_value;
+                ID_EX_B <= reg_rt_value;
+
+                ID_EX_Imm <=
+                    {{16{IF_ID_IR[15]}},
+                     IF_ID_IR[15:0]};
+
+                ID_EX_type <= decoded_type;
+
+            end
+
+
+            // ====================================================
+            // IF/ID PIPELINE REGISTER + PC
+            // ====================================================
+
+            if (branch_taken) begin
+
+                // Branch target
+
+                PC <= branch_target;
+
+                IF_ID_IR <= 32'd0;
+                IF_ID_NPC <= 32'd0;
+                IF_ID_valid <= 1'b0;
+
+            end
+
+            else if (stall) begin
+
+                // Freeze IF/ID and PC
+
+                PC <= PC;
+
+                IF_ID_IR <= IF_ID_IR;
+                IF_ID_NPC <= IF_ID_NPC;
+                IF_ID_valid <= IF_ID_valid;
+
+            end
+
+            else begin
+
+                IF_ID_IR <= Mem[PC[31:2]];
+                IF_ID_NPC <= PC + 32'd4;
+                IF_ID_valid <= 1'b1;
+
+                PC <= PC + 32'd4;
+
+            end
+
+
+            // ====================================================
+            // Register 0 always remains zero
+            // ====================================================
+
+            register[0] <= 32'd0;
+
+        end
+
+    end
+
+
+    // ============================================================
+    // Initialize instruction memory
+    // ============================================================
+
+    initial begin
+
+        $readmemh("program.hex", Mem);
+
+    end
+
+
+endmodule
